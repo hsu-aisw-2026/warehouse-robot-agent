@@ -16,11 +16,17 @@ coordinate `go_to`는 학생 시스템이 직접 추정하거나 기록한 좌�
 import asyncio
 import json
 import math
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from menlo_runner.llm import ask_vlm
-from menlo_runner.perception import detect_color_blobs
+from menlo_runner.basics import screenshot
+from menlo_runner.completion import CompletionConfig, CompletionTracker
+from menlo_runner.config import load_config
+from menlo_runner.llm import ask_vlm, call_llm
+from menlo_runner.perception import decode_jpeg, detect_color_blobs
+from menlo_runner.scene import delivered_cube_ids, held_cube_info
 
 
 # ------------------------------------------------------------------------
@@ -35,10 +41,34 @@ DESTINATION_SIGN_RULES = {
     "blue": "D",
     "yellow": "E",
 }
+SIGN_TO_PAD_COLOR = {sign: color for color, sign in DESTINATION_SIGN_RULES.items()}
+LANDMARK_LETTERS = {"A", "B", "C", "D", "E"}
 SIGNAGE_NOTE = (
     "A는 conveyor/cube source area이며 destination이 아닙니다. "
     "Destination sign은 B red, C green, D blue, E yellow입니다."
 )
+SIGN_SCAN_YAWS = (-0.9, 0.0, 0.9)
+TARGET_SCAN_YAWS = (-0.85, 0.85, 0.0)
+COLOR_SCAN_YAWS = (-0.9, -0.45, 0.0, 0.45, 0.9)
+CUBE_DISTANCE_K = 70.0
+SIGN_HFOV_HALF_DEG = 30.0
+CAMERA_HFOV_DEG = 60.0
+DEFAULT_CAMERA_HEIGHT_M = 1.25
+CAMERA_PITCH_OFFSET_RAD = 0.0
+GROUND_DISTANCE_MIN_M = 0.45
+GROUND_DISTANCE_MAX_M = 7.0
+NEAR_SOURCE_M = 1.3
+NEAR_PAD_M = 1.4
+CAPTURE_DIR = Path("outputs/level1_captures")
+SOURCE_CUBE_AREA_THRESHOLD = 1200
+SOURCE_CUBE_COUNT_THRESHOLD = 3
+MIN_SIGN_BASELINE_M = 0.65
+MIN_SIGN_TRIANGULATION_ANGLE_DEG = 8.0
+MAX_SIGN_RAY_DISTANCE_M = 14.0
+MAX_SIGN_ESTIMATE_SPREAD_M = 1.8
+SIGN_OBSERVATION_LIMIT = 16
+TRIANGULATION_FORWARD_M = 0.15
+TRIANGULATION_SIDE_M = 1.05
 
 ALLOWED_NEXT_ACTIONS = {
     "search_cube",
@@ -73,11 +103,19 @@ class AgentMemory:
     
     # [알고리즘 핵심] 한번 탐색 및 발견된 객체/패드의 World 좌표를 기록하는 저장소
     known_locations: dict[str, tuple[float, float]] = field(default_factory=dict)
+    location_confidence: dict[str, float] = field(default_factory=dict)
+    sign_observations: dict[str, list[Any]] = field(default_factory=dict)
+    rejected_locations: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
+    last_vlm_summary: str = ""
+    last_action_at: float = 0.0
+    capture_index: int = 0
+    tokamak_api_key: str = ""
 
 @dataclass
 class Observation:
     robot_status: Any
     detections: list[Any]
+    signs: list[Any] = field(default_factory=list)
     note: str = ""
     vlm_summary: str = ""
 
@@ -88,12 +126,29 @@ class ScannedDetection:
     blob_area: int
     centroid: tuple[int, int]
     bbox: tuple[int, int, int, int]
+    frame_size: tuple[int, int]
     head_yaw: float
     head_pitch: float
 
     @property
     def full_bearing_deg(self) -> float:
         return self.angle_deg + math.degrees(self.head_yaw)
+
+@dataclass(frozen=True)
+class SignSighting:
+    letter: str
+    bearing_deg: float
+    confidence: float
+    head_yaw: float
+    position_hint: str = ""
+    raw: str = ""
+
+@dataclass(frozen=True)
+class SignObservation:
+    letter: str
+    robot_xy: tuple[float, float]
+    absolute_bearing_rad: float
+    confidence: float
 
 # ---------------------------------------------------------------------------
 # 기본 제공 및 유틸리티 파서
@@ -144,11 +199,21 @@ def build_decision_context(
     return {
         "task": task,
         "visible_targets": visible,
+        "visible_signs": [
+            {
+                "letter": sign.letter,
+                "bearing_deg": round(sign.bearing_deg, 1),
+                "confidence": round(sign.confidence, 2),
+                "position_hint": sign.position_hint,
+            }
+            for sign in observation.signs
+        ],
         "held_color": memory.held_color,
         "active_color": memory.active_color,
         "stage": memory.stage,
         "delivered_count": memory.delivered_count,
         "known_locations": {k: [round(v[0], 2), round(v[1], 2)] for k, v in memory.known_locations.items()},
+        "sign_observation_counts": {k: len(v) for k, v in sorted(memory.sign_observations.items())},
         "last_result": last_result,
         "note": observation.note,
         "signage_note": SIGNAGE_NOTE,
@@ -163,6 +228,24 @@ async def get_robot_status(ctx: Any) -> Any:
 async def get_camera_frame(ctx: Any) -> bytes:
     return await ctx.get_vision("pov")
 
+def build_signage_vlm_prompt(needed_letter: str | None = None) -> str:
+    target = f" The robot is looking for sign {needed_letter}." if needed_letter else ""
+    return (
+        "Read the warehouse spot signs visible in this robot POV image. "
+        "The signs are large labeled spots A, B, C, D, and E. "
+        f"{SIGNAGE_NOTE} "
+        "Return ONLY JSON like "
+        '{"signs":[{"letter":"A","position":"left|center|right|far_left|far_right",'
+        '"x_position":0.0,"confidence":0.0}]}. '
+        "x_position is the horizontal center of the sign in the image from 0.0 left edge to 1.0 right edge. "
+        "Use an empty signs list if no sign letter is visible."
+        + target
+    )
+
+async def ask_vlm_about_frame(ctx: Any, prompt: str, *, api_key: str) -> str:
+    jpeg = await get_camera_frame(ctx)
+    return ask_vlm(jpeg, prompt, api_key=api_key)
+
 async def get_delivered_count(ctx: Any) -> int:
     return len(await delivered_cube_ids(ctx))
 
@@ -170,9 +253,11 @@ async def get_held_cube_info(ctx: Any) -> dict[str, str] | None:
     held = await held_cube_info(ctx)
     return {"entity_id": held[0], "color": held[1]} if held else None
 
-async def perceive(ctx: Any) -> list[Any]:
+async def perceive(ctx: Any) -> tuple[list[Any], tuple[int, int]]:
     jpeg = await get_camera_frame(ctx)
-    return detect_color_blobs(jpeg)
+    image = decode_jpeg(jpeg)
+    height, width = image.shape[:2]
+    return detect_color_blobs(jpeg), (width, height)
 
 async def set_head(ctx: Any, *, yaw: float | None = None, pitch: float | None = None) -> Any:
     args: dict[str, float] = {}
@@ -204,7 +289,8 @@ async def scan_head(ctx: Any, *, yaws: tuple[float, ...] = (-0.8, 0.0, 0.8), pit
     for yaw in yaws:
         await set_head(ctx, yaw=yaw, pitch=pitch)
         await asyncio.sleep(0.4)
-        for detection in await perceive(ctx):
+        detections, frame_size = await perceive(ctx)
+        for detection in detections:
             all_detections.append(
                 ScannedDetection(
                     color=detection.color,
@@ -212,120 +298,765 @@ async def scan_head(ctx: Any, *, yaws: tuple[float, ...] = (-0.8, 0.0, 0.8), pit
                     blob_area=detection.blob_area,
                     centroid=detection.centroid,
                     bbox=detection.bbox,
+                    frame_size=frame_size,
                     head_yaw=yaw,
                     head_pitch=pitch,
                 )
             )
     return all_detections
 
+async def capture_view(ctx: Any, memory: AgentMemory, label: str) -> str | None:
+    memory.capture_index += 1
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_") or "view"
+    path = CAPTURE_DIR / f"{memory.capture_index:04d}_{safe_label}.jpg"
+    try:
+        await screenshot(ctx, f"Capture {memory.capture_index}: {label}", path)
+    except Exception as exc:
+        print(f"Capture failed ({label}): {exc}")
+        return None
+    return str(path)
+
+def _robot_xy_yaw(robot_status: Any) -> tuple[float, float, float]:
+    pose = robot_status.robot.pose
+    return pose.position[0], pose.position[1], math.radians(pose.yaw_deg)
+
+def _xy_from_bearing(
+    robot_status: Any,
+    bearing_deg: float,
+    distance_m: float,
+) -> tuple[float, float]:
+    rx, ry, yaw = _robot_xy_yaw(robot_status)
+    absolute_bearing = yaw + math.radians(bearing_deg)
+    return (
+        rx + distance_m * math.cos(absolute_bearing),
+        ry + distance_m * math.sin(absolute_bearing),
+    )
+
+def _distance_to_xy(robot_status: Any, xy: tuple[float, float]) -> float:
+    rx, ry, _ = _robot_xy_yaw(robot_status)
+    return math.hypot(xy[0] - rx, xy[1] - ry)
+
+def _format_xy(xy: tuple[float, float] | None) -> str:
+    if xy is None:
+        return "None"
+    return f"({xy[0]:+.2f}, {xy[1]:+.2f})"
+
+def _absolute_bearing_rad(robot_status: Any, bearing_deg: float) -> float:
+    _, _, yaw = _robot_xy_yaw(robot_status)
+    return yaw + math.radians(bearing_deg)
+
+def _cross2(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return a[0] * b[1] - a[1] * b[0]
+
+def _ray_intersection(
+    a: SignObservation,
+    b: SignObservation,
+) -> tuple[tuple[float, float], float] | None:
+    ax, ay = a.robot_xy
+    bx, by = b.robot_xy
+    baseline = math.hypot(bx - ax, by - ay)
+    if baseline < MIN_SIGN_BASELINE_M:
+        return None
+
+    da = (math.cos(a.absolute_bearing_rad), math.sin(a.absolute_bearing_rad))
+    db = (math.cos(b.absolute_bearing_rad), math.sin(b.absolute_bearing_rad))
+    denom = _cross2(da, db)
+    if abs(denom) < 1e-3:
+        return None
+
+    angle = abs(math.degrees(math.atan2(denom, da[0] * db[0] + da[1] * db[1])))
+    angle = min(angle, 180.0 - angle)
+    if angle < MIN_SIGN_TRIANGULATION_ANGLE_DEG:
+        return None
+
+    delta = (bx - ax, by - ay)
+    ta = _cross2(delta, db) / denom
+    tb = _cross2(delta, da) / denom
+    if not (0.4 <= ta <= MAX_SIGN_RAY_DISTANCE_M and 0.4 <= tb <= MAX_SIGN_RAY_DISTANCE_M):
+        return None
+
+    confidence = min(a.confidence, b.confidence) * min(1.0, angle / 35.0)
+    return ((ax + ta * da[0], ay + ta * da[1]), confidence)
+
+def _too_close_to_rejected(memory: AgentMemory, key: str, xy: tuple[float, float]) -> bool:
+    return any(math.hypot(xy[0] - bad[0], xy[1] - bad[1]) < 1.0 for bad in memory.rejected_locations.get(key, []))
+
+def reject_location(memory: AgentMemory, key: str) -> None:
+    old = memory.known_locations.pop(key, None)
+    memory.location_confidence.pop(key, None)
+    memory.sign_observations.pop(key, None)
+    if old is not None:
+        memory.rejected_locations.setdefault(key, []).append(old)
+
+def triangulate_sign_location(memory: AgentMemory, key: str) -> tuple[tuple[float, float], float] | None:
+    observations = memory.sign_observations.get(key, [])
+    intersections: list[tuple[tuple[float, float], float]] = []
+
+    for i, first in enumerate(observations):
+        for second in observations[i + 1 :]:
+            candidate = _ray_intersection(first, second)
+            if candidate is not None:
+                intersections.append(candidate)
+
+    if not intersections:
+        return None
+
+    total_weight = sum(max(weight, 0.05) for _, weight in intersections)
+    x = sum(point[0] * max(weight, 0.05) for point, weight in intersections) / total_weight
+    y = sum(point[1] * max(weight, 0.05) for point, weight in intersections) / total_weight
+    spread = max(math.hypot(point[0] - x, point[1] - y) for point, _ in intersections)
+    if spread > MAX_SIGN_ESTIMATE_SPREAD_M:
+        return None
+
+    confidence = min(0.95, sum(weight for _, weight in intersections) / max(2, len(intersections)))
+    return (x, y), confidence
+
+def record_sign_observation(
+    memory: AgentMemory,
+    robot_status: Any,
+    sighting: SignSighting,
+) -> tuple[tuple[float, float], float] | None:
+    rx, ry, _ = _robot_xy_yaw(robot_status)
+    observation = SignObservation(
+        letter=sighting.letter,
+        robot_xy=(rx, ry),
+        absolute_bearing_rad=_absolute_bearing_rad(robot_status, sighting.bearing_deg),
+        confidence=sighting.confidence,
+    )
+    rows = memory.sign_observations.setdefault(sighting.letter, [])
+
+    # Keep one representative observation per nearby robot pose so repeated
+    # head yaws from the same spot do not pretend to be triangulation.
+    for index, old in enumerate(rows):
+        if math.hypot(old.robot_xy[0] - rx, old.robot_xy[1] - ry) < 0.35:
+            if sighting.confidence > old.confidence:
+                rows[index] = observation
+            break
+    else:
+        rows.append(observation)
+
+    del rows[:-SIGN_OBSERVATION_LIMIT]
+    estimate = triangulate_sign_location(memory, sighting.letter)
+    if estimate is None:
+        return None
+
+    xy, confidence = estimate
+    if _too_close_to_rejected(memory, sighting.letter, xy):
+        return None
+
+    remember_location(memory, sighting.letter, xy, confidence=confidence)
+    return xy, confidence
+
+def _position_hint_to_bearing(position: str) -> float:
+    normalized = position.lower().replace("-", "_").replace(" ", "_")
+    if "far_left" in normalized:
+        return -35.0
+    if "left" in normalized:
+        return -22.0
+    if "far_right" in normalized:
+        return 35.0
+    if "right" in normalized:
+        return 22.0
+    return 0.0
+
+def _x_position_to_bearing(row: dict[str, Any]) -> float | None:
+    for key in ("x_position", "x", "center_x", "horizontal_center"):
+        raw = row.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 1.0:
+            value = value / 100.0
+        if 0.0 <= value <= 1.0:
+            return (value - 0.5) * 2.0 * SIGN_HFOV_HALF_DEG
+    return None
+
+def _json_blob(text: str) -> Any | None:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`")
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:].strip()
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start >= 0 and end > start:
+        stripped = stripped[start : end + 1]
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+def parse_sign_sightings(text: str, *, head_yaw: float) -> list[SignSighting]:
+    data = _json_blob(text)
+    rows: list[Any] = []
+    if isinstance(data, dict):
+        for key in ("signs", "visible_signs", "spots", "landmarks"):
+            if isinstance(data.get(key), list):
+                rows = data[key]
+                break
+    elif isinstance(data, list):
+        rows = data
+
+    sightings: list[SignSighting] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_letter = row.get("letter") or row.get("sign") or row.get("spot")
+        if not isinstance(raw_letter, str):
+            continue
+        match = re.search(r"[ABCDE]", raw_letter.upper())
+        if not match:
+            continue
+        letter = match.group(0)
+        position = str(row.get("position") or row.get("horizontal_position") or row.get("location") or "center")
+        confidence_raw = row.get("confidence", 0.65)
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            confidence = 0.65
+        image_bearing = _x_position_to_bearing(row)
+        if image_bearing is None:
+            image_bearing = _position_hint_to_bearing(position)
+        bearing = image_bearing + math.degrees(head_yaw)
+        sightings.append(
+            SignSighting(
+                letter=letter,
+                bearing_deg=bearing,
+                confidence=max(0.0, min(confidence, 1.0)),
+                head_yaw=head_yaw,
+                position_hint=position,
+                raw=str(row)[:160],
+            )
+        )
+
+    if sightings:
+        return sightings
+
+    # Backup parser for models that answer in prose instead of JSON.
+    for letter in sorted(set(re.findall(r"\b[ABCDE]\b", text.upper()))):
+        sightings.append(SignSighting(letter=letter, bearing_deg=math.degrees(head_yaw), confidence=0.35, head_yaw=head_yaw, raw=text[:160]))
+    return sightings
+
+def remember_location(
+    memory: AgentMemory,
+    key: str,
+    xy: tuple[float, float],
+    *,
+    confidence: float,
+) -> None:
+    old = memory.known_locations.get(key)
+    old_conf = memory.location_confidence.get(key, 0.0)
+    if old is None or confidence >= old_conf:
+        blend = 0.0 if old is None or confidence >= 0.95 else 0.35
+        memory.known_locations[key] = (
+            old[0] * blend + xy[0] * (1.0 - blend) if old else xy[0],
+            old[1] * blend + xy[1] * (1.0 - blend) if old else xy[1],
+        )
+        memory.location_confidence[key] = max(confidence, old_conf)
+
+async def scan_signage(
+    ctx: Any,
+    memory: AgentMemory,
+    robot_status: Any,
+    *,
+    needed_letter: str | None = None,
+    yaws: tuple[float, ...] = SIGN_SCAN_YAWS,
+    label_prefix: str = "sign_scan",
+) -> list[SignSighting]:
+    api_key = getattr(getattr(ctx, "config", None), "tokamak_api_key", "")
+    if not api_key:
+        try:
+            api_key = load_config(require_tokamak=False).tokamak_api_key
+        except Exception:
+            api_key = ""
+    if not api_key:
+        return []
+
+    sightings: list[SignSighting] = []
+    for yaw in yaws:
+        await set_head(ctx, yaw=yaw, pitch=0.05)
+        await asyncio.sleep(0.25)
+        await capture_view(ctx, memory, f"{label_prefix}_{needed_letter or 'any'}_yaw_{yaw:+.2f}")
+        try:
+            reply = await ask_vlm_about_frame(
+                ctx,
+                build_signage_vlm_prompt(needed_letter),
+                api_key=api_key,
+            )
+        except Exception as exc:
+            memory.last_vlm_summary = f"VLM failed: {exc}"
+            continue
+
+        memory.last_vlm_summary = reply[:500]
+        parsed = parse_sign_sightings(reply, head_yaw=yaw)
+        if parsed:
+            print(
+                "Sign scan "
+                f"{label_prefix} yaw={yaw:+.2f}: "
+                + ", ".join(f"{item.letter}@{item.bearing_deg:+.1f}deg conf={item.confidence:.2f}" for item in parsed)
+            )
+        else:
+            print(f"Sign scan {label_prefix} yaw={yaw:+.2f}: no parsed signs | VLM={reply[:120]!r}")
+        for sighting in parsed:
+            sightings.append(sighting)
+            estimate = record_sign_observation(memory, robot_status, sighting)
+            count = len(memory.sign_observations.get(sighting.letter, []))
+            if estimate is None:
+                print(f"  {sighting.letter}: observation_count={count}, waiting for triangulation")
+            else:
+                xy, confidence = estimate
+                print(f"  {sighting.letter}: triangulated at {_format_xy(xy)} confidence={confidence:.2f}")
+
+    return sightings
+
+async def half_turn_for_search(ctx: Any, memory: AgentMemory, target_letter: str | None) -> dict[str, Any]:
+    result = await move_velocity(ctx, vx=0.2, wz=0.5, duration_s=6.3)
+    await capture_view(ctx, memory, f"half_turn_search_{target_letter or 'target'}")
+    return result_summary(result)
+
+def _contains_sign(sightings: list[SignSighting], letter: str | None) -> bool:
+    return letter is not None and any(s.letter == letter for s in sightings)
+
+def _observation_contains_sign(observation: Observation, letter: str | None) -> bool:
+    return letter is not None and any(sign.letter == letter for sign in observation.signs)
+
+async def search_landmark_with_turnaround(
+    ctx: Any,
+    memory: AgentMemory,
+    *,
+    target_letter: str,
+) -> list[SignSighting]:
+    robot_status = await get_robot_status(ctx)
+    first_sightings = await scan_signage(
+        ctx,
+        memory,
+        robot_status,
+        needed_letter=target_letter,
+        yaws=TARGET_SCAN_YAWS,
+        label_prefix="look_left_right",
+    )
+    if target_letter in memory.known_locations:
+        return first_sightings
+
+    target_sighting = _best_target_sighting(first_sightings, target_letter)
+    if target_sighting is not None:
+        memory.search_turns += 1
+        viewpoint_xy = _triangulation_viewpoint_xy(robot_status, target_sighting, memory.search_turns)
+        print(
+            f"{target_letter} was visible but not triangulated yet; "
+            f"moving laterally 90deg from bearing {target_sighting.bearing_deg:+.1f}deg "
+            f"to second viewpoint {_format_xy(viewpoint_xy)} before turning around."
+        )
+        result = await go_to_xy(ctx, *viewpoint_xy)
+        print(f"Second viewpoint move result: {result_summary(result)}")
+        await capture_view(ctx, memory, f"second_viewpoint_for_{target_letter}")
+        robot_status = await get_robot_status(ctx)
+        viewpoint_sightings = await scan_signage(
+            ctx,
+            memory,
+            robot_status,
+            needed_letter=target_letter,
+            yaws=TARGET_SCAN_YAWS,
+            label_prefix="second_viewpoint_left_right",
+        )
+        if target_letter in memory.known_locations:
+            return first_sightings + viewpoint_sightings
+        first_sightings = first_sightings + viewpoint_sightings
+
+        target_sighting = _best_target_sighting(viewpoint_sightings, target_letter)
+        if target_sighting is not None:
+            memory.search_turns += 1
+            opposite_xy = _triangulation_viewpoint_xy(robot_status, target_sighting, memory.search_turns)
+            print(
+                f"{target_letter} is still visible but triangulation is weak; "
+                f"trying opposite lateral viewpoint {_format_xy(opposite_xy)}."
+            )
+            result = await go_to_xy(ctx, *opposite_xy)
+            print(f"Opposite viewpoint move result: {result_summary(result)}")
+            await capture_view(ctx, memory, f"opposite_viewpoint_for_{target_letter}")
+            robot_status = await get_robot_status(ctx)
+            opposite_sightings = await scan_signage(
+                ctx,
+                memory,
+                robot_status,
+                needed_letter=target_letter,
+                yaws=TARGET_SCAN_YAWS,
+                label_prefix="opposite_viewpoint_left_right",
+            )
+            if target_letter in memory.known_locations:
+                return first_sightings + opposite_sightings
+            first_sightings = first_sightings + opposite_sightings
+
+    await half_turn_for_search(ctx, memory, target_letter)
+    robot_status = await get_robot_status(ctx)
+    second_sightings = await scan_signage(
+        ctx,
+        memory,
+        robot_status,
+        needed_letter=target_letter,
+        yaws=TARGET_SCAN_YAWS,
+        label_prefix="after_half_turn_left_right",
+    )
+    return first_sightings + second_sightings
+
 # ---------------------------------------------------------------------------
 # [학생 TODO 1] 시각 기반 정밀 월드 좌표 추정 함수 (Mathematical Localization)
 # ---------------------------------------------------------------------------
+def _camera_height_m(robot_status: Any) -> float:
+    position = getattr(getattr(robot_status, "robot", None), "pose", None)
+    raw_position = getattr(position, "position", None)
+    if raw_position is not None and len(raw_position) >= 3:
+        try:
+            height = float(raw_position[2])
+        except (TypeError, ValueError):
+            height = DEFAULT_CAMERA_HEIGHT_M
+        if 0.7 <= height <= 2.2:
+            return height
+    return DEFAULT_CAMERA_HEIGHT_M
+
+def _xy_from_body_offset(robot_status: Any, forward_m: float, left_m: float) -> tuple[float, float]:
+    rx, ry, yaw = _robot_xy_yaw(robot_status)
+    return (
+        rx + forward_m * math.cos(yaw) + left_m * math.cos(yaw + math.pi / 2),
+        ry + forward_m * math.sin(yaw) + left_m * math.sin(yaw + math.pi / 2),
+    )
+
+def _ground_plane_xy_from_detection(
+    observation: Observation,
+    detection: ScannedDetection,
+) -> tuple[tuple[float, float], float] | None:
+    width, height = detection.frame_size
+    if width <= 0 or height <= 0:
+        return None
+
+    _, y, _, bbox_h = detection.bbox
+    y_bottom = min(height - 1, max(0, y + bbox_h))
+    fx = (width / 2.0) / math.tan(math.radians(CAMERA_HFOV_DEG / 2.0))
+    fy = fx
+    alpha = math.atan2(y_bottom - height / 2.0, fy)
+    downward_angle = detection.head_pitch + CAMERA_PITCH_OFFSET_RAD + alpha
+    if downward_angle <= math.radians(4.0):
+        return None
+
+    forward_m = _camera_height_m(observation.robot_status) / math.tan(downward_angle)
+    if not (GROUND_DISTANCE_MIN_M <= forward_m <= GROUND_DISTANCE_MAX_M):
+        return None
+
+    bearing_rad = math.radians(detection.full_bearing_deg)
+    left_m = forward_m * math.tan(bearing_rad)
+    xy = _xy_from_body_offset(observation.robot_status, forward_m, left_m)
+    return xy, forward_m
+
+def _blob_size_xy_from_detection(
+    observation: Observation,
+    detection: ScannedDetection,
+) -> tuple[float, float] | None:
+    if detection.blob_area <= 0:
+        return None
+    distance = CUBE_DISTANCE_K / math.sqrt(detection.blob_area)
+    distance = max(0.55, min(distance, 5.5))
+    return _xy_from_bearing(observation.robot_status, detection.full_bearing_deg, distance)
+
+def _candidate_detections_for_target(
+    observation: Observation,
+    target_color: str,
+) -> list[ScannedDetection]:
+    if target_color in {"A", "cube", "any"}:
+        return observation.detections
+    pad_color = SIGN_TO_PAD_COLOR.get(target_color)
+    if pad_color is not None:
+        return [d for d in observation.detections if d.color == pad_color]
+    return [d for d in observation.detections if d.color == target_color]
+
+def _select_detection_for_target(
+    observation: Observation,
+    target_color: str,
+    targets: list[ScannedDetection],
+) -> ScannedDetection:
+    if target_color in SIGN_TO_PAD_COLOR:
+        sign = _best_target_sighting(observation.signs, target_color)
+        if sign is not None:
+            close_to_sign = [
+                detection
+                for detection in targets
+                if abs(detection.full_bearing_deg - sign.bearing_deg) <= 35.0
+            ]
+            if close_to_sign:
+                return min(
+                    close_to_sign,
+                    key=lambda detection: (
+                        abs(detection.full_bearing_deg - sign.bearing_deg),
+                        -detection.blob_area,
+                    ),
+                )
+    return max(targets, key=lambda detection: detection.blob_area)
+
 def estimate_target_xy_from_observation(observation: Observation, target_color: str | None) -> tuple[float, float] | None:
     if not target_color:
         return None
-        
-    # 타겟 색상과 일치하는 시각 블롭 필터링 (가장 큰 인스턴스 선택)
-    targets = [d for d in observation.detections if d.color == target_color]
+
+    targets = _candidate_detections_for_target(observation, target_color)
     if not targets:
         return None
-    matched_target = max(targets, key=lambda t: t.blob_area)
-    
-    # 현재 로봇의 전역 기하 정보 추출
-    try:
-        rx = observation.robot_status.robot.pose.position[0]
-        ry = observation.robot_status.robot.pose.position[1]
-        robot_yaw = math.radians(observation.robot_status.robot.pose.yaw_deg)
-    except Exception:
+
+    matched_target = _select_detection_for_target(observation, target_color, targets)
+    ground_estimate = _ground_plane_xy_from_detection(observation, matched_target)
+    if ground_estimate is not None:
+        xy, distance = ground_estimate
+        print(
+            f"Ground-plane estimate for {target_color}: "
+            f"xy={_format_xy(xy)} distance={distance:.2f}m "
+            f"bbox={matched_target.bbox} frame={matched_target.frame_size}"
+        )
+        return xy
+
+    xy = _blob_size_xy_from_detection(observation, matched_target)
+    if xy is not None:
+        print(
+            f"Blob-size fallback estimate for {target_color}: "
+            f"xy={_format_xy(xy)} area={matched_target.blob_area}"
+        )
+    return xy
+
+def _nearest_visible_blob_area(observation: Observation, color: str | None = None) -> int:
+    candidates = observation.detections if color is None else [d for d in observation.detections if d.color == color]
+    if not candidates:
+        return 0
+    return max(int(d.blob_area) for d in candidates)
+
+def _source_cube_evidence(observation: Observation) -> tuple[int, int]:
+    large_blobs = [detection for detection in observation.detections if int(detection.blob_area) >= SOURCE_CUBE_AREA_THRESHOLD]
+    return len(large_blobs), _nearest_visible_blob_area(observation)
+
+def maybe_remember_source_at_current_pose(memory: AgentMemory, observation: Observation) -> bool:
+    saw_a = _observation_contains_sign(observation, "A")
+    large_count, max_area = _source_cube_evidence(observation)
+    if saw_a and (large_count >= SOURCE_CUBE_COUNT_THRESHOLD or max_area >= 7000):
+        rx, ry, _ = _robot_xy_yaw(observation.robot_status)
+        remember_location(memory, "A", (rx, ry), confidence=0.9)
+        print(
+            "A source accepted at current pose "
+            f"{_format_xy((rx, ry))}: saw A and cube evidence "
+            f"(large_blobs={large_count}, max_area={max_area})."
+        )
+        return True
+    return False
+
+def _relative_explore_xy(robot_status: Any, search_turn: int) -> tuple[float, float]:
+    # Body-frame waypoints. go_to handles path planning, so these can reveal
+    # signs hidden behind shelves/walls better than spinning in place.
+    pattern = (
+        (2.6, 0.0),
+        (1.8, 1.6),
+        (1.8, -1.6),
+        (3.2, 0.9),
+        (3.2, -0.9),
+        (-0.8, 1.8),
+    )
+    forward, left = pattern[search_turn % len(pattern)]
+    rx, ry, yaw = _robot_xy_yaw(robot_status)
+    return (
+        rx + forward * math.cos(yaw) + left * math.cos(yaw + math.pi / 2),
+        ry + forward * math.sin(yaw) + left * math.sin(yaw + math.pi / 2),
+    )
+
+def _best_target_sighting(sightings: list[SignSighting], target_letter: str) -> SignSighting | None:
+    candidates = [sighting for sighting in sightings if sighting.letter == target_letter]
+    if not candidates:
         return None
-        
-    # 절대 방위각 계산 = 로봇 기준 각도 + 머리 각도 및 화면 오프셋
-    absolute_bearing = robot_yaw + math.radians(matched_target.full_bearing_deg)
-    
-    # 원근 투영 모델 기반 거리 역산 역추정 공식 (실제 카메라 화각 상수 K 보정 적용)
-    # 카메라 렌즈 기준 면적과 거리는 반비례 관계를 가집니다.
-    K_FACTOR = 1100.0 
-    distance = K_FACTOR / math.sqrt(matched_target.blob_area)
-    
-    # 주행 안전 제약조건 매핑 (최소 0.4m ~ 최대 6.0m 클리핑)
-    distance = max(0.4, min(distance, 6.0))
-    
-    # 삼각기하학 월드 좌표 좌표계 변환 적용
-    tx = rx + distance * math.cos(absolute_bearing)
-    ty = ry + distance * math.sin(absolute_bearing)
-    
-    return (tx, ty)
+    return min(candidates, key=lambda sighting: (abs(sighting.bearing_deg), -sighting.confidence))
+
+def _triangulation_viewpoint_xy(
+    robot_status: Any,
+    sighting: SignSighting,
+    search_turn: int,
+) -> tuple[float, float]:
+    rx, ry, yaw = _robot_xy_yaw(robot_status)
+    target_bearing = yaw + math.radians(sighting.bearing_deg)
+    side = TRIANGULATION_SIDE_M if search_turn % 2 == 0 else -TRIANGULATION_SIDE_M
+    perpendicular = target_bearing + math.pi / 2
+    return (
+        rx + TRIANGULATION_FORWARD_M * math.cos(target_bearing) + side * math.cos(perpendicular),
+        ry + TRIANGULATION_FORWARD_M * math.sin(target_bearing) + side * math.sin(perpendicular),
+    )
 
 # ---------------------------------------------------------------------------
 # [학생 TODO 2] 고급 LLM 의사결정 자율 루프 (ReAct 파이프라인)
 # ---------------------------------------------------------------------------
+ACTION_DESCRIPTIONS = {
+    "search_cube": "Look for the A source area or visible cubes. Use when no reliable source/cube target exists.",
+    "navigate_to_cube": "Move toward the remembered A source area or a visually estimated cube coordinate.",
+    "pick_cube": "Pick the nearest cube. Use only when a cube is close enough or the robot is near A.",
+    "search_pad": "Search for the destination sign matching the held cube. Use when that pad coordinate is unknown or rejected.",
+    "navigate_to_pad": "Move to a triangulated/remembered destination pad coordinate.",
+    "place_cube": "Place the held cube. Use only near the matching destination and after visual confirmation.",
+    "recover": "Back up or change viewpoint after failed navigation, target loss, or unsafe state.",
+    "skip_target": "Abandon the current unreliable target and search again.",
+    "stop": "Stop only when the task is complete or continuing is unsafe/impossible.",
+}
+
+def fallback_decision(observation: Observation, memory: AgentMemory) -> AgentDecision:
+    if not memory.held_color:
+        if "A" in memory.known_locations and _distance_to_xy(observation.robot_status, memory.known_locations["A"]) <= NEAR_SOURCE_M:
+            return AgentDecision(next_action="pick_cube", target_color="A", reason="Fallback: near A source; pick nearest cube.")
+        if _observation_contains_sign(observation, "A") and _source_cube_evidence(observation)[0] >= SOURCE_CUBE_COUNT_THRESHOLD:
+            return AgentDecision(next_action="pick_cube", target_color="cube", reason="Fallback: A sign and nearby cube evidence indicate source is reached.")
+        if _nearest_visible_blob_area(observation) >= 7000:
+            return AgentDecision(next_action="pick_cube", target_color="cube", reason="Fallback: a cube-sized blob is very close.")
+        if "A" in memory.known_locations:
+            return AgentDecision(next_action="navigate_to_cube", target_color="A", reason="Fallback: navigate to remembered A source.")
+        if observation.detections:
+            return AgentDecision(next_action="navigate_to_cube", target_color="cube", reason="Fallback: cubes are visible; approach nearest cube.")
+        return AgentDecision(next_action="search_cube", target_color="A", reason="Fallback: search for A source or cubes.")
+
+    target_letter = DESTINATION_SIGN_RULES.get(memory.held_color)
+    if target_letter is None:
+        return AgentDecision(next_action="recover", reason=f"Fallback: unknown held color {memory.held_color!r}.")
+    if (
+        target_letter in memory.known_locations
+        and _distance_to_xy(observation.robot_status, memory.known_locations[target_letter]) <= NEAR_PAD_M
+        and _observation_contains_sign(observation, target_letter)
+    ):
+        return AgentDecision(next_action="place_cube", target_color=target_letter, reason="Fallback: matching pad is nearby and visible.")
+    if target_letter in memory.known_locations and _distance_to_xy(observation.robot_status, memory.known_locations[target_letter]) <= NEAR_PAD_M:
+        reject_location(memory, target_letter)
+        return AgentDecision(next_action="search_pad", target_color=target_letter, reason="Fallback: estimated pad is nearby but not visible; reject and rescan.")
+    if target_letter in memory.known_locations:
+        return AgentDecision(next_action="navigate_to_pad", target_color=target_letter, reason="Fallback: navigate to triangulated destination pad.")
+    return AgentDecision(next_action="search_pad", target_color=target_letter, reason="Fallback: search for destination sign.")
+
 async def decide_next_action(
     task: str,
     observation: Observation,
     memory: AgentMemory,
     last_result: dict[str, Any] | None = None,
 ) -> AgentDecision:
-    
     context = build_decision_context(task, observation, memory, last_result)
-    
-    # 텍스트 에이전트 전 전역 행동 지침서 구성
-    system_instruction = f"""
-    당신은 창고 환경에서 자율 기동하는 휴머노이드 로봇의 고수준 추론 감독관입니다.
-    현재 레벨에서는 scene_state 및 개체 ID 접근이 전면 금지되어 있으므로 오직 기억 장치와 시야 마스크만을 이용해 판단해야 합니다.
+    context["available_actions"] = ACTION_DESCRIPTIONS
+    context["routing_rules"] = {
+        "source": "A",
+        "red": "B",
+        "green": "C",
+        "blue": "D",
+        "yellow": "E",
+    }
+    large_count, max_area = _source_cube_evidence(observation)
+    context["source_evidence"] = {
+        "saw_A_sign": _observation_contains_sign(observation, "A"),
+        "large_cube_blob_count": large_count,
+        "max_cube_blob_area": max_area,
+        "source_location_known": "A" in memory.known_locations,
+    }
+    context["safety_rules"] = [
+        "Do not choose place_cube unless the held cube's matching sign is visible nearby.",
+        "If a destination coordinate is unknown, choose search_pad before navigate_to_pad.",
+        "If a sign was seen but not triangulated, search_pad is preferred so the controller can gather another viewpoint.",
+        "For source A, if saw_A_sign is true and cube blobs are close, choose pick_cube rather than repeatedly searching.",
+        "If not holding a cube, choose search_cube, navigate_to_cube, or pick_cube.",
+        "If holding a cube, choose search_pad, navigate_to_pad, place_cube, or recover.",
+    ]
 
-    [작업 실행 흐름 프로토콜]
-    1. 손이 비어있다면(held_color가 null): 무조건 패드 'A'(큐브 컨베이어 구역)로 기동하여 무작위 큐브를 집어 올려야 합니다('pick_cube'). 만약 'A' 좌표를 모른다면 즉시 'search_pad'를 수행하여 찾으세요.
-    2. 무언가 집고 있다면(held_color 확인): 들고 있는 큐브 색상과 매칭되는 전용 수령 패드 규칙을 파악하세요 (red->B, green->C, blue->D, yellow->E).
-    3. 목적지 패드의 전역 위치 정보가 'known_locations'에 기록되어 있다면 해당 위치로 즉시 자율 네비게이션을 수행하세요 ('navigate_to_pad').
-    4. 만약 목적지 패드가 메모리에 없다면 시야각 안에 들어올 때까지 방위를 변경하거나 주변 공간으로 기동하여 패드를 직접 눈으로 탐색해야 합니다 ('search_pad').
-    5. 패드 영역에 도달했을 때 'place_cube' 액션을 기동하세요.
+    api_key = memory.tokamak_api_key
+    if not api_key:
+        try:
+            api_key = load_config(require_tokamak=False).tokamak_api_key
+        except Exception:
+            api_key = ""
+    if not api_key:
+        decision = fallback_decision(observation, memory)
+        decision.reason = "No TOKAMAK_API_KEY; " + decision.reason
+        return decision
 
-    출력 형식 규칙: 반드시 구조화된 양식의 JSON 문자열 형태로만 반환해야 하며, 부가적인 설명글이나 마크다운 래퍼 기호를 일절 금지합니다.
-    Format: {{"next_action": "지정액션", "target_color": "대상지정", "reason": "논리적 근거"}}
-    """
+    system_prompt = (
+        "You are the high-level decision maker for a Level 1 warehouse robot sorting task. "
+        "Choose exactly one next_action from the provided available_actions. "
+        "You do not output low-level velocity commands. The controller will execute your high-level action. "
+        "Return ONLY JSON with this schema: "
+        '{"next_action":"search_pad","target_color":"C","reason":"short reason","recovery_strategy":null}. '
+        "target_color may be a cube color, 'cube', or a sign letter A/B/C/D/E depending on the action."
+    )
 
     try:
-        user_input = json.dumps(context, ensure_ascii=False)
-        reply = await call_llm([
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": user_input}
-        ])
+        reply = call_llm(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+            ],
+            api_key=api_key,
+            timeout_s=45,
+        )
         decision = parse_agent_decision(reply)
-        if decision:
+        if decision is not None:
+            decision.reason = "LLM: " + decision.reason
             return decision
-    except Exception as e:
-        print(f"[LLM Exception 발생]: {e}")
+        print(f"LLM decision parse failed: {reply[:300]!r}")
+    except Exception as exc:
+        print(f"LLM decision call failed: {exc}")
 
-    # [Fallback Safety Net]: 파싱 불안정 혹은 예외 발생 시 자율 상태 머신 분기 작동
-    if not memory.held_color:
-        if "A" in memory.known_locations:
-            return AgentDecision(next_action="navigate_to_cube", target_color="A", reason="Fallback: 기기록된 소스 영역 기동")
-        return AgentDecision(next_action="search_cube", target_color="A", reason="Fallback: 컨베이어 벨트 구역 수색 명령")
-    else:
-        target_pad = DESTINATION_SIGN_RULES.get(memory.held_color, "B")
-        if target_pad in memory.known_locations:
-            return AgentDecision(next_action="navigate_to_pad", target_color=target_pad, reason="Fallback: 기저장 패드 최단 기동")
-        return AgentDecision(next_action="search_pad", target_color=target_pad, reason="Fallback: 미지 목적지 패드 회전 스캔 기동")
+    decision = fallback_decision(observation, memory)
+    decision.reason = "LLM unavailable/invalid; " + decision.reason
+    return decision
 
 # ---------------------------------------------------------------------------
 # [학생 TODO 3] 시계열 관찰값 수집 및 자동 매핑 가속화
 # ---------------------------------------------------------------------------
 async def observe_world(ctx: Any, memory: AgentMemory) -> Observation:
     robot_status = await get_robot_status(ctx)
-    
-    # 맵 내부 기동 중 효율적인 스팟 확보를 위해 360도 전방위 파노라마형 헤드 서보 기동 수행
-    scanned_detections = await scan_head(ctx, yaws=(-1.0, -0.5, 0.0, 0.5, 1.0))
-    
-    current_obs = Observation(robot_status=robot_status, detections=scanned_detections)
-    
-    # [알고리즘 핵심]: 스캔 도중 포착된 모든 표지판 및 타겟의 위치를 실시간 삼각함수로 추정하여 영구 기억소자에 바인딩
-    for target in scanned_detections:
-        estimated_pos = estimate_target_xy_from_observation(current_obs, target.color)
-        if estimated_pos:
-            # 타겟 오브젝트가 패드 표지판 계열이거나 유의미한 크기일 때 전역 맵 정보 갱신
-            if target.color in ["A", "B", "C", "D", "E"] or target.blob_area > 1500:
-                memory.known_locations[target.color] = estimated_pos
-                
+    scanned_detections = await scan_head(ctx, yaws=COLOR_SCAN_YAWS)
+    needed_letter = None
+    if memory.held_color:
+        needed_letter = DESTINATION_SIGN_RULES.get(memory.held_color)
+    elif "A" not in memory.known_locations:
+        needed_letter = "A"
+
+    signs: list[SignSighting] = []
+    should_scan_sign = needed_letter is not None and needed_letter not in memory.known_locations
+    if (
+        memory.held_color
+        and needed_letter in memory.known_locations
+        and _distance_to_xy(robot_status, memory.known_locations[needed_letter]) <= NEAR_PAD_M * 1.8
+    ):
+        should_scan_sign = True
+    if should_scan_sign:
+        signs = await scan_signage(
+            ctx,
+            memory,
+            robot_status,
+            needed_letter=needed_letter,
+            yaws=TARGET_SCAN_YAWS if memory.held_color else SIGN_SCAN_YAWS,
+            label_prefix="observe_target_sign" if memory.held_color else "observe_source_sign",
+        )
+
+    current_obs = Observation(
+        robot_status=robot_status,
+        detections=scanned_detections,
+        signs=signs,
+        note="",
+        vlm_summary=memory.last_vlm_summary,
+    )
+    if not memory.held_color:
+        maybe_remember_source_at_current_pose(memory, current_obs)
+    if (
+        needed_letter in SIGN_TO_PAD_COLOR
+        and _observation_contains_sign(current_obs, needed_letter)
+        and needed_letter not in memory.known_locations
+    ):
+        pad_xy = estimate_target_xy_from_observation(current_obs, needed_letter)
+        if pad_xy is not None and not _too_close_to_rejected(memory, needed_letter, pad_xy):
+            remember_location(memory, needed_letter, pad_xy, confidence=0.96)
+            print(
+                f"{needed_letter} pad accepted from ground-plane camera estimate "
+                f"at {_format_xy(pad_xy)}."
+            )
+
+    note = (
+        f"known={sorted(memory.known_locations)} "
+        f"needed={needed_letter or '-'}"
+    )
+    current_obs.note = note
     return current_obs
 
 # ---------------------------------------------------------------------------
@@ -361,6 +1092,10 @@ def update_memory(memory: AgentMemory, observation: Observation, decision: Agent
     memory.logs.append({
         "observation": {
             "visible_count": len(observation.detections),
+            "visible_signs": [sign.letter for sign in observation.signs],
+            "known_locations": {key: tuple(round(v, 2) for v in xy) for key, xy in sorted(memory.known_locations.items())},
+            "sign_observation_counts": {key: len(value) for key, value in sorted(memory.sign_observations.items())},
+            "rejected_locations": {key: len(value) for key, value in sorted(memory.rejected_locations.items())},
             "delivered_count": memory.delivered_count,
             "held_color": memory.held_color,
             "stage": memory.stage
@@ -390,44 +1125,83 @@ async def execute_decision(
     observation: Observation,
     memory: AgentMemory,
 ) -> dict[str, Any]:
-    
-    # 1. 탐색 액션 분기: 주변 각 속도 명령을 인가하여 로봇 몸체를 회전시키며 전 공간의 특징점 추출
     if decision.next_action in {"search_cube", "search_pad"}:
-        # 제자리에서 일정 각도 선회 기동 연출 (시야 제약 극복용 몸체 회전)
-        await move_velocity(ctx, wz=0.5, duration_s=1.8)
-        return {"action": decision.next_action, "status": "repositioned_and_scanned"}
+        needed_letter = decision.target_color if decision.target_color in LANDMARK_LETTERS else None
+        if needed_letter:
+            sightings = await search_landmark_with_turnaround(ctx, memory, target_letter=needed_letter)
+        else:
+            sightings = await scan_signage(ctx, memory, observation.robot_status, needed_letter=needed_letter)
+        if needed_letter and needed_letter in memory.known_locations:
+            return {
+                "action": decision.next_action,
+                "status": "landmark_found",
+                "target": needed_letter,
+                "target_xy": memory.known_locations[needed_letter],
+                "reason": "target sign has enough observations for triangulated coordinate",
+            }
+        if decision.next_action == "search_cube" and observation.detections:
+            return {"action": decision.next_action, "status": "cube_blob_visible", "visible_count": len(observation.detections)}
 
-    # 2. 이동 액션 분기: 기억 데이터 체크 후 기동 타겟 설정
+        memory.search_turns += 1
+        current_status = await get_robot_status(ctx)
+        explore_xy = _relative_explore_xy(current_status, memory.search_turns)
+        result = await go_to_xy(ctx, *explore_xy)
+        await capture_view(ctx, memory, f"{decision.next_action}_explore_viewpoint")
+        return {
+            "action": decision.next_action,
+            "status": "explored_new_viewpoint",
+            "target": needed_letter,
+            "sightings": [s.letter for s in sightings],
+            "target_seen": _contains_sign(sightings, needed_letter),
+            "target_observation_count": len(memory.sign_observations.get(needed_letter, [])) if needed_letter else 0,
+            "reason": "target coordinate not triangulated yet, moved to new exploration viewpoint",
+            "explore_xy": explore_xy,
+            "result": result_summary(result),
+        }
+
     if decision.next_action in {"navigate_to_cube", "navigate_to_pad"}:
-        # 우선순위 1: 기억 데이터베이스 조회
         target_xy = memory.known_locations.get(decision.target_color)
-        
-        # 우선순위 2: 기억 데이터에 공백이 존재할 경우 실시간 시야각 마스크에서 역산
         if not target_xy:
             target_xy = estimate_target_xy_from_observation(observation, decision.target_color)
-            
+
         if target_xy is None:
-            # 기동 대상에 도달할 수 없는 상태인 경우 무작위 안전 기동 방향타 인가 유도
-            await move_velocity(ctx, vx=0.3, wz=0.2, duration_s=1.5)
-            return {"action": decision.next_action, "status": "failed", "reason": "좌표 데이터 부재로 인한 랜덤 순항"}
-            
+            memory.search_turns += 1
+            current_status = await get_robot_status(ctx)
+            explore_xy = _relative_explore_xy(current_status, memory.search_turns)
+            result = await go_to_xy(ctx, *explore_xy)
+            await capture_view(ctx, memory, f"{decision.next_action}_failed_then_explored")
+            return {
+                "action": decision.next_action,
+                "status": "failed_then_explored",
+                "reason": "no coordinate estimate",
+                "explore_xy": explore_xy,
+                "result": result_summary(result),
+            }
+
         result = await go_to_xy(ctx, *target_xy)
+        await capture_view(ctx, memory, f"{decision.next_action}_{decision.target_color or 'target'}")
+        if decision.target_color in LANDMARK_LETTERS:
+            remember_location(memory, decision.target_color, target_xy, confidence=memory.location_confidence.get(decision.target_color, 0.6))
         return {"action": decision.next_action, "target_xy": target_xy, "result": result_summary(result)}
 
-    # 3. 조작 관리 액션 분기
     if decision.next_action == "pick_cube":
         result = await pick_nearest_cube(ctx)
+        await capture_view(ctx, memory, "after_pick_cube")
         return {"action": "pick_cube", "result": result_summary(result)}
 
     if decision.next_action == "place_cube":
         result = await place_nearest_zone(ctx)
+        await capture_view(ctx, memory, "after_place_cube")
         return {"action": "place_cube", "result": result_summary(result)}
 
-    # 4. 자율 안전 예외 복구 분기 (벽면 충돌 및 교착 타개 프로토콜)
     if decision.next_action == "recover":
-        await move_velocity(ctx, vx=-0.25, duration_s=1.2) # 후방 세이프티 스텝 기동
-        await move_velocity(ctx, wz=0.4, duration_s=1.0)
-        return {"action": "recover", "status": "recovery_maneuver_complete"}
+        memory.search_turns += 1
+        await move_velocity(ctx, vx=-0.25, duration_s=1.0)
+        await capture_view(ctx, memory, "recover_back_step")
+        explore_xy = _relative_explore_xy(observation.robot_status, memory.search_turns)
+        result = await go_to_xy(ctx, *explore_xy)
+        await capture_view(ctx, memory, "recover_replanned_viewpoint")
+        return {"action": "recover", "status": "backed_up_and_replanned", "explore_xy": explore_xy, "result": result_summary(result)}
 
     return {"action": decision.next_action, "status": "no_op"}
 
@@ -441,9 +1215,7 @@ async def run_agent(
     completion: CompletionConfig | None = None,
 ) -> AgentMemory:
     memory = AgentMemory()
-    # 시뮬레이션 초기 원점 위치 보정을 위해 초기화 패드 수색 좌표 선입력 (옵션 타겟 튜닝 가능)
-    memory.known_locations["A"] = (0.0, 0.0) 
-    
+    memory.tokamak_api_key = getattr(getattr(ctx, "config", None), "tokamak_api_key", "")
     last_result: dict[str, Any] | None = None
     tracker = CompletionTracker(completion) if completion is not None else None
 
@@ -464,6 +1236,11 @@ async def run_agent(
         
         # 2. LLM / Fallback을 통한 의사결정 추론
         decision = await decide_next_action(TASK, observation, memory, last_result)
+        print(f"Observation note: {observation.note}")
+        print(f"Known locations: { {k: tuple(round(v, 2) for v in xy) for k, xy in sorted(memory.known_locations.items())} }")
+        print(f"Sign observation counts: { {k: len(v) for k, v in sorted(memory.sign_observations.items())} }")
+        if last_result is not None:
+            print(f"Last result summary: {last_result}")
         print(f"-> Selected Action: {decision.next_action} (Target: {decision.target_color})")
         print(f"-> Reason: {decision.reason}")
 
@@ -472,6 +1249,10 @@ async def run_agent(
 
         # 3. 행동 실행기 구동
         action_result = await execute_decision(ctx, decision, observation, memory)
+        print(f"Action result: {action_result}")
+        action_capture = await capture_view(ctx, memory, f"cycle_{cycle:03d}_after_{decision.next_action}")
+        if action_capture is not None:
+            action_result["capture_path"] = action_capture
         
         # 4. 물리 피드백 및 검증 정보 래핑
         verified = await verify_outcome(ctx, decision, action_result)
